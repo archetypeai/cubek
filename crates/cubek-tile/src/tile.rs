@@ -4,6 +4,7 @@ use cubecl::{
     cmma::{self, Matrix, MatrixIdent, MatrixLayout},
     prelude::barrier::Barrier,
     prelude::*,
+    quant::scheme::QuantScheme,
     std::tensor::{
         AsView, AsViewExpand, AsViewMut, AsViewMutExpand, View, ViewMut,
         layout::{Coords1d, CoordsDyn, Layout, LayoutExpand, tiled_view::TiledLayout},
@@ -54,6 +55,10 @@ impl Storage {
 /// with [`tile`](TileArg::tile). The physical vectorization is a plain comptime value (the
 /// `vector_size` field), not a type parameter — the buffer is served scalar and re-grouped into
 /// `Vector<E, vector_size>` lines in-kernel.
+///
+/// `E` is the element physically in the tensor. For a quantized operand
+/// ([`quantized`](TileArgLaunch::quantized) attaches the scales), `E` is the storage element and
+/// [`tile_dequant`](TileArg::tile_dequant) picks the served type.
 #[derive(CubeType, CubeLaunch)]
 pub struct TileArg<'a, E: Numeric> {
     pub tensor: &'a Tensor<E>,
@@ -65,11 +70,19 @@ pub struct TileArg<'a, E: Numeric> {
     pub space: Space,
     #[cube(comptime)]
     pub storage: Storage,
+    /// Quantization side-channel, `None` for a plain operand (every constructor's default;
+    /// [`quantized`](TileArgLaunch::quantized) opts in).
+    pub quant: ComptimeOption<QuantArg>,
 }
 
 #[cube]
 impl<'a, E: Numeric> TileArg<'a, E> {
+    /// Serve the tensor's own element type. The plain path — a quantized operand must go through
+    /// [`tile_dequant`](Self::tile_dequant) to name its served type.
     pub fn tile(&self) -> Tile<E> {
+        if comptime!(self.quant.is_some()) {
+            panic!("TileArg::tile: a quantized operand is served via TileArg::tile_dequant")
+        }
         Tile::from_tensor(
             self.tensor,
             comptime!(self.vector_size),
@@ -77,6 +90,53 @@ impl<'a, E: Numeric> TileArg<'a, E> {
             comptime!(self.storage),
         )
     }
+
+    /// Serve `O` from a storage-typed operand: `quant = Some` attaches the scale + scheme so reads
+    /// dequantize `E → O` transparently; `quant = None` is the plain path (the launch binds
+    /// `E == O`). For kernels that thread both types via `#[define]` and run quantized or not.
+    pub fn tile_dequant<O: Numeric>(&self) -> Tile<O> {
+        // `#[comptime]`: whether the operand is quantized is a trace-time fact, so the match
+        // resolves at expand and the plain path pays nothing.
+        let quant = #[comptime]
+        match &self.quant {
+            // Per-tensor native: a single scale at flat index 0.
+            ComptimeOption::Some(q) => ComptimeOption::new_Some(QuantInfo {
+                scale: q.scales[0],
+                scheme: comptime!(q.scheme),
+            }),
+            ComptimeOption::None => ComptimeOption::new_None(),
+        };
+        Tile::<O>::from_tensor_quant::<E>(
+            self.tensor,
+            comptime!(self.vector_size),
+            comptime!(self.space.clone()),
+            comptime!(self.storage),
+            quant,
+        )
+    }
+}
+
+/// The quantization a tile's backing store carries so reads dequantize transparently: a runtime
+/// `scale` (per-tensor for now) plus the comptime [`QuantScheme`]. Lives on [`MemData`], not the
+/// [`Tile`] — the tile serves `T`; that the buffer secretly holds quantized data is a storage
+/// detail its consumers need not know.
+#[derive(CubeType, Clone)]
+#[expand(derive(Clone))]
+pub struct QuantInfo {
+    pub scale: f32,
+    #[cube(comptime)]
+    pub scheme: QuantScheme,
+}
+
+/// The quantization side-channel of a [`TileArg`]: the scale grid plus the comptime
+/// [`QuantScheme`] that says how to fold it back in. Optional on the arg so the *same* kernel runs
+/// quantized or not (the tile dequantizes on read).
+#[derive(CubeType, CubeLaunch)]
+pub struct QuantArg {
+    /// Per-tensor scales (currently a single value at flat index 0).
+    pub scales: OwnedTensor<f32>,
+    #[cube(comptime)]
+    pub scheme: QuantScheme,
 }
 
 /// One operand's data: the runtime [`TileKind`] and the comptime [`Space`] it projects. The
@@ -139,6 +199,9 @@ pub struct MemData<T: Numeric> {
     /// always `false` there; gmem inherits its operand's launch-time flag.
     #[cube(comptime)]
     check: bool,
+    /// Present when the buffer physically holds quantized data (see [`QuantInfo`]): reads through
+    /// [`Tile::flat`] dequantize into `T`; every other element view refuses the tile.
+    pub(crate) quant: ComptimeOption<QuantInfo>,
 }
 
 /// A TMA tensor-map source: the launch-built `ViewMut` (backed by a `TensorMapTiled` `ViewArg`),
@@ -173,6 +236,25 @@ impl<T: Numeric> Tile<T> {
         #[comptime] space: Space,
         #[comptime] storage: Storage,
     ) -> Tile<T> {
+        Tile::<T>::from_tensor_quant::<T>(
+            tensor,
+            vector_size,
+            space,
+            storage,
+            ComptimeOption::new_None(),
+        )
+    }
+
+    /// [`from_tensor`](Tile::from_tensor) from a storage-typed tensor: the buffer physically holds
+    /// `I` while the tile serves `T`, dequantizing on read per `quant`. The plain path is `I == T`
+    /// with `quant == None`; [`TileArg::tile_dequant`] is the kernel-side constructor.
+    pub fn from_tensor_quant<I: Numeric>(
+        tensor: &Tensor<I>,
+        #[comptime] vector_size: usize,
+        #[comptime] space: Space,
+        #[comptime] storage: Storage,
+        quant: ComptimeOption<QuantInfo>,
+    ) -> Tile<T> {
         let start_axis = comptime!(storage.start_axis);
         let num_tiled = comptime!(space.rank() - storage.start_axis);
         let levels = comptime!(storage.levels);
@@ -196,7 +278,14 @@ impl<T: Numeric> Tile<T> {
                 physical_strides.push(stride);
             }
         }
-        let buffer = unsafe { tensor.as_slice().as_boxed_unchecked() };
+        // Re-typing the buffer to the served `T` is only a static coercion — a quantized store
+        // truly holds `I` bytes; the transparent read view downcasts back (`MemData::flat_storage`).
+        let buffer = unsafe {
+            tensor
+                .as_slice()
+                .downcast_unchecked::<T>()
+                .as_boxed_unchecked()
+        };
         // Logical bound folded from the physical shape, so it's correct for tiled
         // operands too (the physical buffer is padded; the logical extent is not).
         let bound = logical_bound(&physical_shape, start_axis, num_tiled, levels);
@@ -216,6 +305,7 @@ impl<T: Numeric> Tile<T> {
                 num_tiled,
                 levels,
                 check: comptime!(storage.check_bounds),
+                quant,
             }),
             space: comptime!(space),
         }
@@ -251,6 +341,7 @@ impl<T: Numeric> Tile<T> {
                 num_tiled: comptime!(space.rank()),
                 levels: comptime!(0usize),
                 check: comptime!(false),
+                quant: ComptimeOption::new_None(),
             }),
             space: comptime!(space),
         }
@@ -345,7 +436,14 @@ impl<T: Numeric> Tile<T> {
     /// (`self.vector_size`); pass `Const<1>` when only the (width-invariant) leading shape is needed.
     pub fn view<W: Size>(&self) -> View<'_, Vector<T, W>, CoordsDyn> {
         match &self.tile_kind {
-            TileKind::Gmem(g) => g.lines::<W>().view(g.base()).view(g.window()),
+            TileKind::Gmem(g) => {
+                if comptime!(g.quant.is_some()) {
+                    panic!(
+                        "Tile::view: a quantized tile only serves dequantized reads (Tile::flat)"
+                    )
+                }
+                g.lines::<W>().view(g.base()).view(g.window())
+            }
             TileKind::Smem(g) => g.lines::<W>().view(g.base()).view(g.window()),
             TileKind::TmaGmem(_) => panic!("Tile::view: a tma source has no element view"),
             TileKind::Cmma(_) => panic!("Tile::view: a cmma fragment has no memory view"),
@@ -355,6 +453,9 @@ impl<T: Numeric> Tile<T> {
     pub fn view_mut<W: Size>(&mut self) -> ViewMut<'_, Vector<T, W>, CoordsDyn> {
         match &mut self.tile_kind {
             TileKind::Gmem(g) => {
+                if comptime!(g.quant.is_some()) {
+                    panic!("Tile::view_mut: writing a quantized tile requires requantization")
+                }
                 let base = g.base();
                 let window = g.window();
                 g.lines_mut::<W>().view_mut(base).view_mut(window)
@@ -647,9 +748,20 @@ impl<T: Numeric> MemData<T> {
         self.buffer.as_vectorized_mut().with_vector_size_mut::<W>()
     }
 
+    /// [`lines`](MemData::lines) with the buffer re-typed to the quantized storage element `I` —
+    /// what a quantized store truly holds (see [`QuantInfo`]), so the coercion only undoes
+    /// construction's.
+    fn lines_storage<I: Numeric, W: Size>(&self) -> &[Vector<I, W>] {
+        let storage = unsafe { self.buffer.downcast_unchecked::<I>() };
+        storage.as_vectorized().with_vector_size::<W>()
+    }
+
     /// Re-view this buffer through `layout` as a [`MatrixView`], carrying its own `check` flag
     /// so the leaf masks without being asked.
     pub(crate) fn masked<W: Size>(&self, layout: BatchMatrix) -> MatrixView<'_, Vector<T, W>> {
+        if comptime!(self.quant.is_some()) {
+            panic!("Tile::matrix: a quantized tile only serves dequantized reads (Tile::flat)")
+        }
         MaskedView::new(
             self.lines::<W>()
                 .view(self.base())
@@ -664,6 +776,9 @@ impl<T: Numeric> MemData<T> {
         &mut self,
         layout: BatchMatrix,
     ) -> MatrixViewMut<'_, Vector<T, W>> {
+        if comptime!(self.quant.is_some()) {
+            panic!("Tile::matrix_mut: writing a quantized tile requires requantization")
+        }
         let base = self.base();
         let window = self.window();
         let check = comptime!(self.check);
@@ -689,8 +804,23 @@ impl<T: Numeric> MemData<T> {
         )
     }
 
+    /// [`flat`](MemData::flat) over the storage element `I` a quantized buffer truly holds; the
+    /// [`QuantizedView`](crate::QuantizedView) wraps it to dequantize each read.
+    pub(crate) fn flat_storage<I: Numeric, W: Size>(&self) -> FlatView<'_, Vector<I, W>> {
+        FlatView::new(
+            self.lines_storage::<I, W>()
+                .view(self.base())
+                .view(self.window())
+                .view(FlatLayout::new(self.extent.clone())),
+            comptime!(self.check),
+        )
+    }
+
     /// The mutable twin of [`flat`](MemData::flat).
     pub(crate) fn flat_mut<W: Size>(&mut self) -> FlatViewMut<'_, Vector<T, W>> {
+        if comptime!(self.quant.is_some()) {
+            panic!("Tile::flat_mut: writing a quantized tile requires requantization")
+        }
         let base = self.base();
         let window = self.window();
         let extent = self.extent.clone();
@@ -770,6 +900,7 @@ impl<T: Numeric> MemData<T> {
             num_tiled: comptime!(self.num_tiled),
             levels: comptime!(self.levels),
             check: comptime!(self.check),
+            quant: self.quant.clone(),
         }
     }
 }
