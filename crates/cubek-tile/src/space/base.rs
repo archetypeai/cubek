@@ -4,7 +4,7 @@
 use cubecl::prelude::*;
 use cubecl::zspace::SmallVec;
 
-use crate::{Axis, Leaf, MAX_AXES, Partitioner};
+use crate::{Axis, Distribution, Leaf, MAX_AXES, Partitioner};
 
 use super::ByAxis;
 
@@ -173,13 +173,17 @@ impl Space {
         Space::with_sizes(merged, sizes)
     }
 
-    /// This (sized) space's runtime size along `axis`, read from the per-axis `sizes`. Only valid
-    /// once filled (a `Dynamic` axis on an unsized space has none).
+    /// This space's runtime size along `axis`: a `Static` axis folds to its comptime extent
+    /// (so a fully-static operand needs no `sizes` at all), a `Dynamic` one reads the
+    /// per-axis `sizes` — only valid once filled.
     fn size(&self, #[comptime] axis: Axis) -> usize {
-        *self
-            .extents
-            .sizes
-            .index(comptime!(self.clone().position(axis)))
+        match comptime!(self.clone().extent_raw(axis)) {
+            Extent::Static(n) => comptime!(n).runtime(),
+            Extent::Dynamic => *self
+                .extents
+                .sizes
+                .index(comptime!(self.clone().position(axis))),
+        }
     }
 }
 
@@ -269,12 +273,33 @@ impl Space {
         self.axes().all(|axis| !self.is_dynamic(axis))
     }
 
+    /// Whether this level's walk is host data: every extent `Static` and every axis
+    /// `Sequential` (no hardware digit to decode), so an unrolled walk's regions fold
+    /// to comptime coordinates.
+    pub(crate) fn static_walkable(&self) -> bool {
+        self.is_static()
+            && self.axes().all(|axis| {
+                matches!(
+                    self.partitioner().distribution(axis),
+                    Distribution::Sequential
+                )
+            })
+    }
+
     pub fn extent_at(&self, i: usize) -> usize {
         self.extent(self.axis_at(i))
     }
 
     pub fn axis_at(&self, i: usize) -> Axis {
         self.extents.axis_at(i)
+    }
+
+    /// Whether axis position `p` is `Spatial` `TilesEach(1)`: its walk count is
+    /// comptime `1`, so a step decode can skip it.
+    pub(crate) fn single_tile_at(&self, p: usize) -> bool {
+        self.partitioner()
+            .distribution(self.axis_at(p))
+            .single_tile()
     }
 
     pub fn position(&self, axis: Axis) -> usize {
@@ -320,6 +345,15 @@ impl Space {
         }
     }
 
+    /// Reorder so `fastest` walks innermost (last axis fastest): each coarser-axis
+    /// window then feeds a consecutive burst of steps — the unrolled fragment walk's
+    /// emission order.
+    pub fn with_fastest(&self, fastest: Axis) -> Space {
+        let mut axes: Vec<Axis> = self.axes().filter(|&a| a != fastest).collect();
+        axes.push(fastest);
+        self.project(&axes)
+    }
+
     pub fn project(&self, axes: &[Axis]) -> Space {
         let entries = axes
             .iter()
@@ -357,6 +391,15 @@ impl Space {
             partitioner = partitioner.next();
         }
         false
+    }
+
+    /// Whether a walk over this level leaves `operand`'s window unchanged: every axis the
+    /// walk actually steps (more than one tile) is absent from the operand — the same
+    /// structural fact as broadcast omission. A [`Staged`](crate::Schedule::Staged) walk
+    /// fills such an operand once, above the loop. Host-side, static extents.
+    pub fn walk_invariant(&self, operand: &Space) -> bool {
+        self.axes()
+            .all(|axis| self.count(axis) == 1 || !operand.contains(axis))
     }
 
     /// The axes in this space but not in `output`, i.e. those contracted.

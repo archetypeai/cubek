@@ -10,6 +10,8 @@ use cubecl::prelude::barrier::Barrier;
 use cubecl::prelude::*;
 use cubecl::unexpanded;
 
+use crate::Region;
+
 use crate::{
     CmmaPartition, Delivery, MemData, Space, Tile, TileExpand, TileKind, TileKindExpand,
     partition_level,
@@ -46,9 +48,12 @@ impl Sync {
 #[derive(CubeType, Clone)]
 #[expand(derive(Clone))]
 pub enum Pipeline {
-    /// Synchronous element copy. `collective` → rendezvous on one `sync_cube` per phase; otherwise a
-    /// single unit fills its own slot with no collective at all.
-    Cube { collective: bool },
+    /// Synchronous cooperative element copy, rendezvoused on one `sync_cube` per phase.
+    /// The variant (not a flag) carries the choice, so the dispatch is comptime and the
+    /// rendezvous emits a bare barrier, never a branch-wrapped one.
+    Cube,
+    /// A single unit fills and reads its own slot: no collective at all.
+    Solo,
     /// Async producer/consumer decoupled over a `full`/`empty` mbarrier pair with a `phase`
     /// parity, so the fill overlaps compute. TMA motivates it, but the barrier itself is
     /// delivery-agnostic; see [`Pipeline::fill`].
@@ -68,8 +73,8 @@ impl Pipeline {
     /// before any bulk copy, for [`Barrier`](Sync::Barrier); nothing to allocate otherwise.
     fn new(#[comptime] sync: Sync) -> Pipeline {
         match sync {
-            Sync::Solo => Pipeline::new_Cube(false),
-            Sync::Cube => Pipeline::new_Cube(true),
+            Sync::Solo => Pipeline::new_Solo(),
+            Sync::Cube => Pipeline::new_Cube(),
             Sync::Barrier => {
                 // full: one producer arrival; empty: one arrival per unit.
                 let full = Barrier::shared(1, UNIT_POS == 0);
@@ -97,7 +102,7 @@ impl Pipeline {
                 (TileKind::Smem(d), TileKind::Gmem(s) | TileKind::Smem(s)) => d.fill_from(s),
                 _ => panic!("Pipeline::fill: unsupported kind pairing"),
             },
-            Pipeline::Cube { .. } => dst.copy_from(src),
+            Pipeline::Cube | Pipeline::Solo => dst.copy_from(src),
         }
     }
 }
@@ -109,6 +114,13 @@ impl Pipeline {
 pub struct Staging<T: CubeType> {
     data: T,
     pipeline: Pipeline,
+    /// Operands the walk leaves invariant: filled once by [`fill_pinned`](Staging::fill_pinned),
+    /// skipped by [`fill_streamed`](Staging::fill_streamed). Only the `(Tile, Tile)` payload sets
+    /// these; a generic slot pins nothing.
+    #[cube(comptime)]
+    pin_lhs: bool,
+    #[cube(comptime)]
+    pin_rhs: bool,
 }
 
 #[cube]
@@ -116,8 +128,18 @@ impl<T: CubeType> Staging<T> {
     /// Wrap an already-built payload and pipeline. Private: the public entry is the operand-deducing
     /// [`new`](Staging::new). (Split out so the tuple `T` never sits in a struct-literal turbofish,
     /// which `#[cube]` can't parse; `Staging::<T>` can.)
-    fn wrap(data: T, pipeline: Pipeline) -> Staging<T> {
-        Staging::<T> { data, pipeline }
+    fn wrap(
+        data: T,
+        pipeline: Pipeline,
+        #[comptime] pin_lhs: bool,
+        #[comptime] pin_rhs: bool,
+    ) -> Staging<T> {
+        Staging::<T> {
+            data,
+            pipeline,
+            pin_lhs,
+            pin_rhs,
+        }
     }
 
     /// Producer acquire: wait the slot is free (`empty`, WAR) for `Barrier`; a `collective` `Cube`
@@ -125,11 +147,8 @@ impl<T: CubeType> Staging<T> {
     fn acquire_write(&self) {
         match &self.pipeline {
             Pipeline::Barrier { empty, phase, .. } => empty.wait_parity(*phase ^ 1),
-            Pipeline::Cube { collective } => {
-                if *collective {
-                    sync_cube();
-                }
-            }
+            Pipeline::Cube => sync_cube(),
+            Pipeline::Solo => {}
         }
     }
 
@@ -142,7 +161,7 @@ impl<T: CubeType> Staging<T> {
                     full.arrive();
                 }
             }
-            Pipeline::Cube { .. } => {}
+            Pipeline::Cube | Pipeline::Solo => {}
         }
     }
 
@@ -151,7 +170,7 @@ impl<T: CubeType> Staging<T> {
     fn acquire_read(&self) {
         match &self.pipeline {
             Pipeline::Barrier { full, phase, .. } => full.wait_parity(*phase),
-            Pipeline::Cube { .. } => {}
+            Pipeline::Cube | Pipeline::Solo => {}
         }
     }
 
@@ -163,7 +182,7 @@ impl<T: CubeType> Staging<T> {
                 empty.arrive();
                 *phase ^= 1;
             }
-            Pipeline::Cube { .. } => {}
+            Pipeline::Cube | Pipeline::Solo => {}
         }
     }
 
@@ -172,12 +191,8 @@ impl<T: CubeType> Staging<T> {
     /// [`consume_final`](Staging::consume_final).
     fn publish(&self) {
         match &self.pipeline {
-            Pipeline::Cube { collective } => {
-                if *collective {
-                    sync_cube();
-                }
-            }
-            Pipeline::Barrier { .. } => {}
+            Pipeline::Cube => sync_cube(),
+            Pipeline::Solo | Pipeline::Barrier { .. } => {}
         }
     }
 }
@@ -191,10 +206,19 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
     pub fn new(
         lhs: &Tile<Lhs>,
         rhs: &Tile<Rhs>,
+        #[comptime] op_space: Space,
         #[comptime] out: Space,
     ) -> Staging<(Tile<Lhs>, Tile<Rhs>)> {
         let lhs_delivery = lhs.delivery();
         let rhs_delivery = rhs.delivery();
+        // Pin an operand only when its window is genuinely fixed across the walk. A barrier
+        // pipeline arrives `full` once per fill, so a TMA pair keeps the joint per-region fill;
+        // splitting an invariant out would corrupt its phase. A dynamic level can't decide
+        // invariance at comptime. Both fall back to streaming (pin = false).
+        let split =
+            comptime!(op_space.is_static() && !lhs_delivery.is_tma() && !rhs_delivery.is_tma());
+        let pin_lhs = comptime!(split && op_space.walk_invariant(&lhs.space));
+        let pin_rhs = comptime!(split && op_space.walk_invariant(&rhs.space));
         let register = comptime!(
             out.partitioner().leaf().is_cmma() && partition_level(&out.divide()).is_some()
         );
@@ -205,14 +229,49 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
             ));
             let a = CmmaPartition::store(comptime!(lhs.space.divide()), comptime!(out.clone()));
             let b = CmmaPartition::store(comptime!(rhs.space.divide()), comptime!(out.clone()));
-            Staging::wrap((a, b), Pipeline::new(Sync::Solo))
+            Staging::wrap((a, b), Pipeline::new(Sync::Solo), pin_lhs, pin_rhs)
         } else {
             let sync = comptime!(Sync::of(lhs_delivery, rhs_delivery));
             Staging::wrap(
                 (MemData::smem_like(lhs), MemData::smem_like(rhs)),
                 Pipeline::new(sync),
+                pin_lhs,
+                pin_rhs,
             )
         }
+    }
+
+    /// Fill the pinned operand(s), those the walk leaves invariant, from `region`'s window.
+    /// Their window never moves, so `region` is region 0 and this runs once, above the loop.
+    /// A no-op when nothing is pinned (both operands stream).
+    pub fn fill_pinned(&mut self, lhs: &Tile<Lhs>, rhs: &Tile<Rhs>, region: &Region) {
+        let pin_lhs = comptime!(self.pin_lhs);
+        let pin_rhs = comptime!(self.pin_rhs);
+        if comptime!(pin_lhs || pin_rhs) {
+            self.fill(|s, pipe| {
+                if comptime!(pin_lhs) {
+                    pipe.fill(&mut s.0, &lhs.at(region));
+                }
+                if comptime!(pin_rhs) {
+                    pipe.fill(&mut s.1, &rhs.at(region));
+                }
+            });
+        }
+    }
+
+    /// Fill the streamed operand(s), everything not pinned, from `region`'s window. Runs per
+    /// region inside the walk.
+    pub fn fill_streamed(&mut self, lhs: &Tile<Lhs>, rhs: &Tile<Rhs>, region: &Region) {
+        let pin_lhs = comptime!(self.pin_lhs);
+        let pin_rhs = comptime!(self.pin_rhs);
+        self.fill(|s, pipe| {
+            if comptime!(!pin_lhs) {
+                pipe.fill(&mut s.0, &lhs.at(region));
+            }
+            if comptime!(!pin_rhs) {
+                pipe.fill(&mut s.1, &rhs.at(region));
+            }
+        });
     }
 }
 

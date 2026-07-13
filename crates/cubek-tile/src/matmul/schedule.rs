@@ -8,49 +8,83 @@ use crate::*;
 
 #[cube]
 impl<Acc: Numeric> Tile<Acc> {
-    /// `Direct`: no staging, every read goes to where the operand lives. The static twin
-    /// steps with indexed `comptime!` because each unrolled copy stamps different host
-    /// data, which the runtime iterator sugar cannot carry.
+    /// `Direct`: no staging, every read goes to where the operand lives. A fragment
+    /// output demands the unrolled walk (its coordinates fold to constants, which
+    /// select fragments); a memory output keeps the compact runtime loop.
     pub(crate) fn mma_direct<Lhs: Numeric, Rhs: Numeric>(
         &mut self,
         lhs: &Tile<Lhs>,
         rhs: &Tile<Rhs>,
-        space: Space,
+        op_space: Space,
     ) {
         if self.tile_kind.static_level(comptime!(self.space.clone())) {
-            let walk = comptime!(StaticWalk::over_fastest(
-                &Space::merge(&[&lhs.space, &rhs.space]),
-                self.space.axis_at(self.space.rank() - 2),
-            ));
-            #[unroll]
-            for i in 0..comptime!(walk.total()) {
-                let region = comptime!(walk.region(i));
-                self.at_static(&region)
-                    .mma(&lhs.at_static(&region), &rhs.at_static(&region));
+            let merged = comptime!({
+                let merged = Space::merge(&[&lhs.space, &rhs.space]);
+                assert!(
+                    merged.is_static(),
+                    "Tile::mma: a fragment output's walk unrolls over the operand merge, \
+                     which must be static (a Dynamic extent cannot fold to the comptime \
+                     coordinates fragment selection takes)"
+                );
+                merged
+            });
+            let walk =
+                Walk::over_fastest(merged, comptime!(self.space.axis_at(self.space.rank() - 2)));
+            for region in walk.unrolled() {
+                self.at(&region).mma(&lhs.at(&region), &rhs.at(&region));
             }
         } else {
-            for region in Walk::over(space) {
+            for region in Walk::over(op_space) {
                 self.at(&region).mma(&lhs.at(&region), &rhs.at(&region));
             }
         }
     }
 
     /// `Staged`: per region, fill a [`Staging`] slot with the operands and consume it
-    /// into the recursion. `consume_final` every region, since no later fill publishes
-    /// within an iteration.
+    /// into the recursion. An operand the walk leaves unchanged (its space lacks every
+    /// walked axis — the same structural fact as broadcast omission) fills its slot once,
+    /// above the loop: re-filling it per region would move the same window again. E.g. an
+    /// N-walk refills one B fragment per step while the whole A partition stays put — the
+    /// legacy single-buffered register budget. `consume_final` every region, since no
+    /// later fill publishes within an iteration.
+    ///
+    /// The walk unrolls when the level *cuts* a fragment-partition output (each region
+    /// selects its block, which takes comptime coordinates) and on a static
+    /// register-staged level (comptime regions land window offsets as immediates — the
+    /// fill-side win at the thin selector point). An smem-staged level stays rolled:
+    /// unrolling would re-stage the recursion's shared memory per copy.
     pub(crate) fn mma_staged<Lhs: Numeric, Rhs: Numeric>(
         &mut self,
         lhs: &Tile<Lhs>,
         rhs: &Tile<Rhs>,
-        space: Space,
+        op_space: Space,
     ) {
-        let mut slot = Staging::new(lhs, rhs, comptime!(self.space.clone()));
-        for region in Walk::over(space) {
-            slot.fill(|s, pipe| {
-                pipe.fill(&mut s.0, &lhs.at(&region));
-                pipe.fill(&mut s.1, &rhs.at(&region));
-            });
-            slot.consume_final(|a, b| self.at(&region).mma(a, b));
+        let cuts = self.tile_kind.cuts_partition(comptime!(self.space.clone()));
+        let register = comptime!(
+            self.space.partitioner().leaf().is_cmma()
+                && partition_level(&self.space.divide()).is_some()
+                && Space::merge(&[&lhs.space, &rhs.space]).static_walkable()
+        );
+        let unroll = comptime!(cuts || register);
+
+        // `Staging` decides which operand (if any) is pinned: walk-invariant, so its window
+        // never moves and it fills once, above the loop. The rest stream, refilled per region.
+        let mut staging = Staging::new(
+            lhs,
+            rhs,
+            comptime!(op_space.clone()),
+            comptime!(self.space.clone()),
+        );
+        let walk = Walk::over(op_space);
+        staging.fill_pinned(lhs, rhs, &walk.region(0));
+        let walk = if comptime!(unroll) {
+            walk.unrolled()
+        } else {
+            walk
+        };
+        for region in walk {
+            staging.fill_streamed(lhs, rhs, &region);
+            staging.consume_final(|a, b| self.at(&region).mma(a, b));
         }
     }
 
@@ -60,14 +94,26 @@ impl<Acc: Numeric> Tile<Acc> {
         &mut self,
         lhs: &Tile<Lhs>,
         rhs: &Tile<Rhs>,
-        space: Space,
+        op_space: Space,
     ) {
-        let mut s0 = Staging::new(lhs, rhs, comptime!(self.space.clone()));
-        let mut s1 = Staging::new(lhs, rhs, comptime!(self.space.clone()));
+        // Double-buffering fills both operands every region (see the raw `fill`s below), so the
+        // pin flags go unread; pass the operation space only to satisfy `new`.
+        let mut s0 = Staging::new(
+            lhs,
+            rhs,
+            comptime!(op_space.clone()),
+            comptime!(self.space.clone()),
+        );
+        let mut s1 = Staging::new(
+            lhs,
+            rhs,
+            comptime!(op_space.clone()),
+            comptime!(self.space.clone()),
+        );
 
         // Double-buffering needs random access (prefetch the next region), so it indexes the
         // `walk` by hand rather than iterating.
-        let walk = Walk::over(space);
+        let walk = Walk::over(op_space);
         let n = walk.total();
 
         // prologue: prime slot 0 with region 0.
@@ -94,7 +140,6 @@ impl<Acc: Numeric> Tile<Acc> {
             // prefetch the next even region back into slot 0 (if it exists), then compute
             // the odd region on slot 1; on the walk's final region no fill follows, so
             // `consume_final` publishes slot 1 itself.
-            let odd_region = walk.region(odd);
             if odd + 1 < n {
                 let next_even = walk.region(odd + 1);
                 s0.fill(|s, pipe| {

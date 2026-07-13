@@ -24,8 +24,8 @@ pub enum TileKind<T: Numeric> {
     Smem(MemData<T>),
     /// MMA-unit-resident, not addressable (no memory view); contraction is `cmma::execute`.
     Cmma(CmmaData<T>),
-    /// A partition of cmma fragments, `m_tiles × n_tiles`, comptime-indexed; walked
-    /// statically ([`at_static`](Tile::at_static)).
+    /// A partition of cmma fragments, `m_tiles × n_tiles`, comptime-indexed; only a
+    /// static walk's regions (constant coordinates) can select through it.
     CmmaPartition(CmmaPartition<T>),
     /// A TMA tensor-map source: not element-addressable, its only sink is a hardware bulk
     /// copy into shared memory. Launched via [`TmaTileArg`], the twin of [`StridedTileArg`].
@@ -39,6 +39,21 @@ impl<T: Numeric> TileKind<T> {
     pub(crate) fn static_level(&self, #[comptime] space: Space) -> comptime_type!(bool) {
         match self {
             TileKind::CmmaPartition(_) => comptime!(partition_level(&space).is_some()),
+            TileKind::Gmem(_) | TileKind::Smem(_) | TileKind::Cmma(_) | TileKind::TmaGmem(_) => {
+                comptime!(false)
+            }
+        }
+    }
+
+    /// Whether a staged walk at this level must be unrolled for correctness: the level
+    /// cuts a fragment partition, so each region selects its block of fragments, which
+    /// takes compile-time coordinates. `(1, 1)` counts (a k-step walk) cut nothing and
+    /// pass the partition through, so they keep the compact runtime loop. Comptime.
+    pub(crate) fn cuts_partition(&self, #[comptime] space: Space) -> comptime_type!(bool) {
+        match self {
+            TileKind::CmmaPartition(_) => {
+                comptime!(matches!(partition_level(&space), Some(c) if c != (1, 1)))
+            }
             TileKind::Gmem(_) | TileKind::Smem(_) | TileKind::Cmma(_) | TileKind::TmaGmem(_) => {
                 comptime!(false)
             }
@@ -79,13 +94,14 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// The [`StageStorage`] layout a stage derived from this tile takes. A TMA bulk copy
-    /// writes its box rows raw, so its stages stay plain strided.
-    pub fn stage_storage(&self) -> comptime_type!(StageStorage) {
+    /// The [`StagePlan`] a stage derived from this tile takes: its [`StageStorage`] layout
+    /// and the launch's cube size. A TMA bulk copy writes its box rows raw and a fragment
+    /// is never a fill source, so both report the plain default (strided, units unknown).
+    pub fn stage(&self) -> comptime_type!(StagePlan) {
         match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => d.stage,
+            TileKind::Gmem(d) | TileKind::Smem(d) => d.stage(),
             TileKind::TmaGmem(_) | TileKind::Cmma(_) | TileKind::CmmaPartition(_) => {
-                comptime!(StageStorage::Strided)
+                comptime!(StagePlan::strided())
             }
         }
     }
@@ -111,34 +127,65 @@ impl<T: Numeric> Tile<T> {
             TileKind::TmaGmem(t) => {
                 TileKind::new_TmaGmem(t.at(region, comptime!(self.space.clone())))
             }
-            // A resident fragment (or partition) passes through unchanged: a runtime
-            // region cannot select fragments. At the partition level, `at_static` selects.
-            TileKind::Cmma(c) => TileKind::new_Cmma(c.clone()),
-            TileKind::CmmaPartition(p) => TileKind::new_CmmaPartition(p.clone()),
+            // A resident fragment passes through unchanged (nothing to window) — legal
+            // only on a level that cuts nothing on m/n, like a k-step walk; a cutting
+            // level would alias every region onto the one fragment.
+            TileKind::Cmma(c) => {
+                comptime!(assert!(
+                    matches!(partition_level(&self.space), None | Some((1, 1))),
+                    "Tile::at: a level that cuts tiles cannot select into a single cmma \
+                     fragment (it needs a fragment partition, or a memory output)"
+                ));
+                TileKind::new_Cmma(c.clone())
+            }
+            // A partition *selects* under a region with comptime coordinates (an
+            // unrolled walk's fold to constants): each region owns a `sub_m × sub_n`
+            // block of the fragments — a level that doesn't cut the partition selects
+            // the whole of it, a 1×1 block is the fragment itself. A runtime region
+            // passes the partition through whole, legal exactly when this level cuts
+            // nothing (a k-step walk); the static fragment walk below then selects.
+            TileKind::CmmaPartition(p) => {
+                let rank = comptime!(self.space.rank());
+                let mi = region
+                    .coord(comptime!(self.space.axis_at(rank - 2)))
+                    .constant();
+                let ni = region
+                    .coord(comptime!(self.space.axis_at(rank - 1)))
+                    .constant();
+                match comptime!(mi.zip(ni)) {
+                    Some((c0, c1)) => {
+                        let (sub_m, sub_n) = comptime!({
+                            let a0 = self.space.axis_at(rank - 2);
+                            let a1 = self.space.axis_at(rank - 1);
+                            let (cm, cn) = (self.space.count(a0), self.space.count(a1));
+                            assert!(
+                                p.m_tiles.is_multiple_of(cm) && p.n_tiles.is_multiple_of(cn),
+                                "Tile::at: the level's grid must divide the fragment partition"
+                            );
+                            (p.m_tiles / cm, p.n_tiles / cn)
+                        });
+                        let mi = comptime!(c0 as usize * sub_m);
+                        let ni = comptime!(c1 as usize * sub_n);
+                        if comptime!(sub_m == 1 && sub_n == 1) {
+                            TileKind::new_Cmma(p.at(mi, ni))
+                        } else {
+                            TileKind::new_CmmaPartition(p.window(mi, ni, sub_m, sub_n))
+                        }
+                    }
+                    None => {
+                        comptime!(assert!(
+                            matches!(partition_level(&self.space), None | Some((1, 1))),
+                            "Tile::at: a level that cuts a fragment partition must be \
+                             walked with compile-time coordinates (an unrolled walk)"
+                        ));
+                        TileKind::new_CmmaPartition(p.clone())
+                    }
+                }
+            }
         };
         Tile::<T> {
             tile_kind,
             space: comptime!(self.space.divide()),
-        }
-    }
-
-    /// [`at`](Tile::at) for a static region: the register tier's windowing. Memory
-    /// windows identically (the coordinates coerce to a runtime [`Region`]); a fragment
-    /// partition *selects* its `(mi, ni)` fragment, which only static coordinates can do.
-    pub fn at_static(&self, #[comptime] region: &StaticRegion) -> Tile<T> {
-        match &self.tile_kind {
-            TileKind::Gmem(_) | TileKind::Smem(_) | TileKind::TmaGmem(_) => {
-                self.at(&Region::from_static(region))
-            }
-            TileKind::CmmaPartition(p) => {
-                let mi = comptime!(region.coord(self.space.axis_at(self.space.rank() - 2)));
-                let ni = comptime!(region.coord(self.space.axis_at(self.space.rank() - 1)));
-                Tile::<T> {
-                    tile_kind: TileKind::new_Cmma(p.at(mi, ni)),
-                    space: comptime!(self.space.divide()),
-                }
-            }
-            TileKind::Cmma(_) => panic!("Tile::at_static: a single fragment has no regions"),
         }
     }
 
@@ -148,8 +195,8 @@ impl<T: Numeric> Tile<T> {
     pub fn runtime_extent(&self, #[comptime] axis: Axis) -> usize {
         let p = comptime!(self.space.position(axis));
         let raw = match &self.tile_kind {
-            TileKind::Gmem(g) | TileKind::Smem(g) => g.bound[p] as usize,
-            TileKind::TmaGmem(t) => t.bound[p] as usize,
+            TileKind::Gmem(g) | TileKind::Smem(g) => g.bound.at(p).fcast::<usize>(),
+            TileKind::TmaGmem(t) => t.bound[p].fcast::<usize>(),
             TileKind::Cmma(_) | TileKind::CmmaPartition(_) => {
                 panic!("Tile::runtime_extent: a cmma fragment has no extent")
             }

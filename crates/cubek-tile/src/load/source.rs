@@ -36,6 +36,8 @@ struct TileSourceData<'a, E, R: Runtime> {
     v: usize,
     check: Option<bool>,
     stage: Option<StageStorage>,
+    /// The launch's cube size (units per cube); set by [`Launcher::arg`](crate::Launcher::arg).
+    units: usize,
     _ty: PhantomData<E>,
 }
 
@@ -60,6 +62,7 @@ impl<'a, E, R: Runtime> StridedTileSource<'a, Unset, Unset, E, R> {
                 v: 1,
                 check: None,
                 stage: None,
+                units: 0,
                 _ty: PhantomData,
             },
             _state: PhantomData,
@@ -130,6 +133,12 @@ impl<'a, Sp, Sub, E, R: Runtime> StridedTileSource<'a, Sp, Sub, E, R> {
         self.data.concrete = Some(space);
         self
     }
+
+    /// The launch's cube size (units per cube); set by [`Launcher::arg`](crate::Launcher::arg).
+    pub(crate) fn cube_units(mut self, units: usize) -> Self {
+        self.data.units = units;
+        self
+    }
 }
 
 impl<'a, E: Numeric, R: Runtime> StridedTileSource<'a, Set, Set, E, R> {
@@ -147,6 +156,7 @@ impl<'a, E: Numeric, R: Runtime> StridedTileSource<'a, Set, Set, E, R> {
             v,
             check,
             stage,
+            units,
             ..
         } = self.data;
         let space = space.unwrap();
@@ -217,6 +227,7 @@ impl<'a, E: Numeric, R: Runtime> StridedTileSource<'a, Set, Set, E, R> {
             space,
             v,
             check,
+            units,
         );
         if let Some(stage) = stage {
             arg = arg.stage(stage);

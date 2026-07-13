@@ -22,6 +22,8 @@ pub struct Storage {
     /// reads/writes must be bounds-checked. Set from divisibility at launch; `false`
     /// keeps the unchecked (divisible) fast path.
     pub check_bounds: bool,
+    /// How stages derived from this operand are laid out and cooperatively filled.
+    pub stage: StagePlan,
 }
 
 impl Storage {
@@ -31,6 +33,7 @@ impl Storage {
             start_axis: 0,
             levels: physical_rank / logical_rank - 1,
             check_bounds: false,
+            stage: StagePlan::default(),
         }
     }
 
@@ -39,12 +42,25 @@ impl Storage {
             start_axis,
             levels,
             check_bounds: false,
+            stage: StagePlan::default(),
         }
     }
 
     /// Set whether edge reads/writes must be bounds-checked.
     pub fn checked(mut self, check_bounds: bool) -> Self {
         self.check_bounds = check_bounds;
+        self
+    }
+
+    /// Set the stage layout the derived stages take.
+    pub fn staged(mut self, layout: StageStorage) -> Self {
+        self.stage.layout = layout;
+        self
+    }
+
+    /// Set the launch's cube size (units per cube).
+    pub fn units(mut self, units: usize) -> Self {
+        self.stage.units = units;
         self
     }
 }
@@ -64,11 +80,9 @@ pub struct StridedTileArg<'a, E: Numeric> {
     pub vector_size: usize,
     #[cube(comptime)]
     pub space: Space,
+    /// The buffer's physical mapping plus the [`StagePlan`] its derived stages take.
     #[cube(comptime)]
     pub storage: Storage,
-    /// Storage layout of the smem stages derived from this operand.
-    #[cube(comptime)]
-    pub stage: StageStorage,
     /// Quantization side-channel, `None` for a plain operand (every constructor's default;
     /// [`quantized`](StridedTileArgLaunch::quantized) opts in).
     pub quant: ComptimeOption<QuantArg>,
@@ -89,7 +103,6 @@ impl<'a, E: Numeric> StridedTileArg<'a, E> {
             comptime!(self.vector_size),
             comptime!(self.space.clone()),
             comptime!(self.storage),
-            comptime!(self.stage),
         )
     }
 
@@ -113,7 +126,6 @@ impl<'a, E: Numeric> StridedTileArg<'a, E> {
             comptime!(self.vector_size),
             comptime!(self.space.clone()),
             comptime!(self.storage),
-            comptime!(self.stage),
             quant,
         )
     }
@@ -172,12 +184,13 @@ impl<E: Numeric, R: Runtime> StridedTileArgLaunch<'static, E, R> {
         space: &Space,
         v: usize,
         check: bool,
+        units: usize,
     ) -> Self {
         Self::strided(
             binding.into_tensor_arg(),
             v,
             space.project(&layout.distinct_axes()),
-            Storage::from(layout).checked(check),
+            Storage::from(layout).checked(check).units(units),
         )
     }
 
@@ -190,15 +203,16 @@ impl<E: Numeric, R: Runtime> StridedTileArgLaunch<'static, E, R> {
         tensor: TensorArg<R>,
         vector_size: usize,
         space: Space,
-        storage: Storage,
+        mut storage: Storage,
     ) -> Self {
-        let stage = StageStorage::for_space(&space);
+        // Default the stage layout from the space; `units` rides in on `storage` (a
+        // `Launcher` stamped it), and [`stage`](Self::stage) can still override the layout.
+        storage.stage.layout = StageStorage::for_space(&space);
         Self::new(
             VecTensorArg::new(tensor, vector_size),
             vector_size,
             space,
             storage,
-            stage,
             ComptimeOptionArgs::None,
         )
     }
@@ -206,7 +220,7 @@ impl<E: Numeric, R: Runtime> StridedTileArgLaunch<'static, E, R> {
     /// Override the derived stages' [`StageStorage`] layout (default
     /// [`StageStorage::for_space`]).
     pub fn stage(mut self, stage: StageStorage) -> Self {
-        self.stage = stage;
+        self.storage.stage.layout = stage;
         self
     }
 
