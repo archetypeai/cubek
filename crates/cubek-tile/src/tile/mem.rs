@@ -39,6 +39,11 @@ pub struct MemData<T: Numeric> {
     /// [`at`](Tile::at) no): such a tile can be written in physical order.
     #[cube(comptime)]
     whole: bool,
+    /// What each lane holds of these cells, stamped across [`at`](Tile::at)s (the level that
+    /// spreads an axis is consumed on the way down). `Partial` means split to an accumulator but
+    /// merely replicated to an operand, so only an accumulator reads it.
+    #[cube(comptime)]
+    pub(crate) lane_share: LaneShare,
     /// Absolute logical extent per axis (the valid region); `origin + pos` beyond it is
     /// the partial-tile overhang. Preserved across [`at`](Tile::at), unlike `extent`.
     pub(crate) bound: Coords<u32>,
@@ -155,6 +160,7 @@ impl<T: Numeric> MemData<T> {
                 extent,
                 window_start: 0u32,
                 whole: comptime!(true),
+                lane_share: comptime!(LaneShare::Whole),
                 bound,
                 start_axis,
                 num_tiled,
@@ -210,6 +216,7 @@ impl<T: Numeric> MemData<T> {
                 extent,
                 window_start: 0u32,
                 whole: comptime!(true),
+                lane_share: comptime!(LaneShare::Whole),
                 bound,
                 start_axis: comptime!(0usize),
                 num_tiled: comptime!(space.rank()),
@@ -706,6 +713,17 @@ impl<T: Numeric> MemData<T> {
         self.masked_mut::<W>(BatchMatrix::new(batches, rows, cols))
     }
 
+    /// The [`AccumulateView`] over batch matrix `i`: [`matrix_mut`](MemData::matrix_mut) plus the
+    /// [`LaneShare`] these cells carry, so a leaf accumulates through it without being told.
+    pub(crate) fn matrix_accumulate<W: Size>(
+        &mut self,
+        i: usize,
+        #[comptime] space: Space,
+    ) -> AccumulateView<'_, T, W> {
+        let lane_share = comptime!(self.lane_share);
+        AccumulateView::new(self.matrix_mut::<W>(i, space), lane_share)
+    }
+
     /// Window down to `region`: shift the origin by the region's tile coordinate times
     /// the sub-tile edge, crop each axis to that edge, re-box the same buffer. `bound`
     /// is carried through unchanged, so the leaf masks correctly at any nesting depth.
@@ -758,6 +776,7 @@ impl<T: Numeric> MemData<T> {
             extent,
             window_start: start,
             whole: comptime!(false),
+            lane_share: comptime!(join_lane_share(self.lane_share, space.lane_share())),
             bound: self.bound.clone(),
             start_axis: comptime!(self.start_axis),
             num_tiled: comptime!(self.num_tiled),

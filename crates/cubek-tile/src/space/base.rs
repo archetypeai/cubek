@@ -4,7 +4,7 @@
 use cubecl::prelude::*;
 use cubecl::zspace::SmallVec;
 
-use crate::{Axis, Distribution, Leaf, MAX_AXES, Partitioner};
+use crate::{Axis, ComputeScope, Distribution, LaneShare, Leaf, MAX_AXES, Partitioner};
 
 use super::ByAxis;
 
@@ -417,6 +417,29 @@ impl Space {
     pub fn walk_invariant(&self, operand: &Space) -> bool {
         self.axes()
             .all(|axis| self.count(axis) == 1 || !operand.contains(axis))
+    }
+
+    /// What the plane's lanes hold of this space's cells: `Partial` once a level spreads an axis
+    /// the space doesn't span, since each lane then covers a disjoint slice of it.
+    pub(crate) fn lane_share(&self) -> LaneShare {
+        if self.partitioner.is_final() {
+            return LaneShare::Whole;
+        }
+        for axis in self.partitioner.axes() {
+            if self.contains(axis) {
+                continue;
+            }
+            if let Distribution::Spatial {
+                scope: ComputeScope::Unit,
+                coverage,
+                ..
+            } = self.partitioner.distribution(axis)
+                && coverage.instances_const().is_some_and(|lanes| lanes > 1)
+            {
+                return LaneShare::Partial;
+            }
+        }
+        LaneShare::Whole
     }
 
     /// The axes in this space but not in `output`, i.e. those contracted.
